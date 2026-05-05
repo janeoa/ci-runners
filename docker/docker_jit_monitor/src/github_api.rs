@@ -121,6 +121,7 @@ pub(crate) fn spawn_runner(config: RunnerConfig) -> Result<DockerContainer, Spaw
         name: config.name,
         process: runner,
         container_type: config.container_type,
+        started_at: std::time::Instant::now(),
     })
 }
 

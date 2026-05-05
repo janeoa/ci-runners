@@ -1,9 +1,9 @@
 use std::{
-    process::{Child, Command},
+    process::{Child, Command, ExitStatus},
     string::FromUtf8Error,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
     thread::{self},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -17,6 +17,9 @@ mod github_api;
 
 static RUNNER_ID: AtomicU64 = AtomicU64::new(0);
 static EXITING: AtomicU32 = AtomicU32::new(0);
+
+const MINIMAL_EXPECTED_CONTAINER_RUN_DURATION: Duration = Duration::from_secs(5);
+const MAX_ALLOWED_ERROR_COUNT: u32 = 10;
 
 /// Returns the hostname or None.
 fn gethostname() -> Option<String> {
@@ -203,10 +206,34 @@ fn iter_test() {
 
 #[derive(Debug)]
 struct DockerContainer {
-    #[allow(unused)]
     name: String,
     process: Child,
     container_type: ContainerType,
+    started_at: Instant,
+}
+
+enum ContainerReturnCode {
+    Success,
+    GenericFail,
+    CouldNotStartContainer,
+    DidNotFindExecutable,
+    DidNotFindCommand,
+    NonDefaultCode,
+    TerminatedViaSignal,
+}
+
+impl From<ExitStatus> for ContainerReturnCode {
+    fn from(status: ExitStatus) -> Self {
+        match status.code() {
+            Some(0) => ContainerReturnCode::Success,
+            Some(1) => ContainerReturnCode::GenericFail,
+            Some(125) => ContainerReturnCode::CouldNotStartContainer,
+            Some(126) => ContainerReturnCode::DidNotFindExecutable,
+            Some(127) => ContainerReturnCode::DidNotFindCommand,
+            None => ContainerReturnCode::TerminatedViaSignal,
+            _ => ContainerReturnCode::NonDefaultCode,
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -233,6 +260,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut running_containers: Vec<DockerContainer> = vec![];
     // Todo: implement something to reserve devices for the duration of the docker run child process.
+
+    let mut failed_container_counter = 0;
 
     loop {
         let exiting = EXITING.load(Ordering::Relaxed);
@@ -276,12 +305,62 @@ fn main() -> anyhow::Result<()> {
         let mut still_running = vec![];
         for mut container in running_containers {
             match container.process.try_wait() {
-                Ok(Some(_exit_status)) => {}
+                Ok(Some(exit_status)) => {
+                    let elapsed = container.started_at.elapsed();
+                    match ContainerReturnCode::from(exit_status) {
+                        ContainerReturnCode::Success => {}
+                        ContainerReturnCode::TerminatedViaSignal => {
+                            info!("Container {} got terminated via signal", container.name)
+                        }
+                        ContainerReturnCode::CouldNotStartContainer
+                        | ContainerReturnCode::DidNotFindCommand
+                        | ContainerReturnCode::DidNotFindExecutable => {
+                            failed_container_counter += 1;
+                            error!(
+                                "ContaineCr {} failed with code {:?}. Error increased to: {}",
+                                container.name,
+                                exit_status.code(),
+                                failed_container_counter
+                            );
+                        }
+                        ContainerReturnCode::GenericFail | ContainerReturnCode::NonDefaultCode => {
+                            if elapsed < MINIMAL_EXPECTED_CONTAINER_RUN_DURATION {
+                                failed_container_counter += 1;
+                                error!(
+                                    "Container {} failed in {:?}, which is shorter than {:?}. Error code: {:?}. Error counter increased to {}",
+                                    container.name,
+                                    elapsed,
+                                    MINIMAL_EXPECTED_CONTAINER_RUN_DURATION,
+                                    exit_status.code(),
+                                    failed_container_counter
+                                );
+                            } else {
+                                info!(
+                                    "Container {} failed, but it took {:?}, which is longer than {:?}. Error code: {:?}. Error counter stays {}",
+                                    container.name,
+                                    elapsed,
+                                    MINIMAL_EXPECTED_CONTAINER_RUN_DURATION,
+                                    exit_status.code(),
+                                    failed_container_counter
+                                )
+                            }
+                        }
+                    }
+                }
                 Ok(None) => still_running.push(container),
                 Err(e) => {
                     error!("Failed to check the exit status of hos-container: {e:?}");
                 }
             }
+        }
+        if failed_container_counter > MAX_ALLOWED_ERROR_COUNT
+            && EXITING.load(Ordering::Relaxed) == 0
+        {
+            error!(
+                "Maximum allowed number of errors ({}) has been reached. Stopping new runners and shutting down gracefully.",
+                failed_container_counter
+            );
+            EXITING.store(1, Ordering::Release);
         }
 
         // If we have idle runners we should kill them.
