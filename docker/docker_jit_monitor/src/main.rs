@@ -262,6 +262,10 @@ fn main() -> anyhow::Result<()> {
                     {
                         info!("Runner name already taken - Will retry with new name later")
                     }
+                    Err(SpawnRunnerError::MissingDockerImage(e)) => {
+                        error!("Image does not exist: {e:?}");
+                        std::process::exit(1)
+                    }
                     Err(e) => {
                         error!("Failed to spawn JIT runner: {e:?}");
                     }
